@@ -285,6 +285,7 @@ class HSLColorAdjust:
     HSL颜色分区调整节点
     
     可以分别调整红、黄、绿、青、蓝五种颜色的色相、饱和度和明度
+    支持 mask 输入，只对 mask=1 的区域应用调色
     """
 
     @classmethod
@@ -294,6 +295,10 @@ class HSLColorAdjust:
                 "image": ("IMAGE",),
             },
             "optional": {
+                "mask": (
+                    "MASK",
+                    {"tooltip": "可选的遮罩，mask=1的区域应用调色，mask=0的区域保持原样"}
+                ),
                 # 红色调整
                 "red_hue": (
                     "FLOAT",
@@ -389,17 +394,77 @@ class HSLColorAdjust:
                     {"default": 15.0, "min": 0.0, "max": 60.0, "step": 1.0,
                      "tooltip": "过渡区域的宽度（度数），值越大过渡越柔和"}
                 ),
+                
+                # Blank 保护
+                "blank_protection": (
+                    "BOOLEAN",
+                    {"default": False, 
+                     "tooltip": "开启后，如果视频前几帧的mask是纯白色（检测异常），会自动替换为纯黑色，避免对空白帧错误调色"}
+                ),
+                "blank_threshold": (
+                    "FLOAT",
+                    {"default": 0.99, "min": 0.5, "max": 1.0, "step": 0.01,
+                     "tooltip": "判定为纯白色mask的阈值，mask平均值大于此值视为纯白"}
+                ),
             }
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
+    RETURN_TYPES = ("IMAGE", "IMAGE", "MASK")
+    RETURN_NAMES = ("image_rgba", "image_rgb", "mask_corrected")
     FUNCTION = "process"
     CATEGORY = "auto_chroma_bg"
+
+    def _apply_blank_protection(self, mask: torch.Tensor, threshold: float) -> torch.Tensor:
+        """
+        Blank 保护：检测视频前几帧的纯白色 mask 并替换为纯黑色
+        
+        逻辑：
+        1. 从第一帧开始检查，找到连续的纯白色 mask
+        2. 找到第一个非纯白色的 mask 帧
+        3. 如果存在这样的模式（前面纯白，后面非纯白），则把前面纯白的帧替换为纯黑
+        
+        Args:
+            mask: [B, H, W] 格式的 mask tensor
+            threshold: 判定纯白色的阈值
+        
+        Returns:
+            处理后的 mask tensor
+        """
+        batch_size = mask.shape[0]
+        
+        # 计算每一帧 mask 的平均值
+        mask_means = []
+        for i in range(batch_size):
+            mean_val = mask[i].mean().item()
+            mask_means.append(mean_val)
+        
+        # 找到第一个非纯白色的帧
+        first_non_white_idx = -1
+        for i in range(batch_size):
+            if mask_means[i] < threshold:
+                first_non_white_idx = i
+                break
+        
+        # 如果没有找到非纯白色的帧，或者第一帧就不是纯白色，不需要处理
+        if first_non_white_idx <= 0:
+            return mask
+        
+        # 检查前面的帧是否都是纯白色
+        all_white_before = all(mask_means[i] >= threshold for i in range(first_non_white_idx))
+        
+        if all_white_before:
+            # 把前面纯白色的帧替换为纯黑色
+            mask = mask.clone()  # 避免修改原始数据
+            for i in range(first_non_white_idx):
+                mask[i] = 0.0
+            print(f"[HSLColorAdjust] Blank保护: 检测到前 {first_non_white_idx} 帧为纯白mask，已替换为纯黑色")
+        
+        return mask
 
     def process(
         self,
         image,
+        mask=None,
         # 红色
         red_hue: float = 0.0,
         red_saturation: float = 1.0,
@@ -423,17 +488,61 @@ class HSLColorAdjust:
         # 全局
         soft_transition: bool = True,
         transition_falloff: float = 15.0,
+        # Blank 保护
+        blank_protection: bool = False,
+        blank_threshold: float = 0.99,
     ):
         # 转换输入
         if not torch.is_tensor(image):
             image = torch.from_numpy(image)
         
+        # 健壮的布尔值判断（防止 ComfyUI 传递字符串）
+        blank_protection_enabled = blank_protection is True or blank_protection == "True" or blank_protection == 1
+        
+        # 处理 mask
+        has_mask = mask is not None
+        if has_mask:
+            if not torch.is_tensor(mask):
+                mask = torch.from_numpy(mask)
+            # 确保 mask 是 [B, H, W] 格式
+            if mask.dim() == 2:
+                mask = mask.unsqueeze(0)  # [H, W] -> [1, H, W]
+            
+            # Blank 保护：检测并修正前几帧的纯白色 mask
+            if blank_protection_enabled and mask.shape[0] > 1:
+                mask = self._apply_blank_protection(mask, blank_threshold)
+        
         # 处理批量图像
         batch_size = image.shape[0]
-        results = []
+        results = []  # RGBA 结果
+        rgb_results = []  # RGB 结果（黑色背景）
+        mask_results = []  # 收集校正后的 mask
         
         for i in range(batch_size):
             img = image[i].cpu().numpy()  # [H, W, C]
+            # 只取 RGB 通道（如果输入是 RGBA）
+            if img.shape[-1] == 4:
+                img = img[..., :3]
+            
+            # 获取当前帧的 mask（用作 alpha 通道）
+            if has_mask:
+                # 如果 mask batch 数量不够，使用最后一个 mask
+                mask_idx = min(i, mask.shape[0] - 1)
+                current_mask = mask[mask_idx].cpu().numpy()  # [H, W]
+                
+                # 调整 mask 尺寸以匹配图像
+                if current_mask.shape[:2] != img.shape[:2]:
+                    import torch.nn.functional as F
+                    mask_tensor = torch.from_numpy(current_mask).unsqueeze(0).unsqueeze(0).float()
+                    target_size = (img.shape[0], img.shape[1])
+                    mask_tensor = F.interpolate(mask_tensor, size=target_size, mode='bilinear', align_corners=False)
+                    current_mask = mask_tensor.squeeze().numpy()
+            else:
+                # 没有 mask 时，alpha 通道全为 1（不透明）
+                current_mask = np.ones((img.shape[0], img.shape[1]), dtype=np.float32)
+            
+            # 收集校正后的 mask
+            mask_results.append(current_mask)
             
             # RGB转HSL
             h, s, l = rgb_to_hsl(img)
@@ -462,13 +571,32 @@ class HSLColorAdjust:
             
             # HSL转回RGB
             rgb_out = hsl_to_rgb(h, s, l)
-            results.append(rgb_out)
+            
+            # 合并 RGB 和 Alpha 通道，输出 RGBA
+            alpha = current_mask[..., np.newaxis]  # [H, W, 1]
+            rgba_out = np.concatenate([rgb_out, alpha], axis=-1)  # [H, W, 4]
+            rgba_out = np.clip(rgba_out, 0, 1).astype(np.float32)
+            
+            # 生成 RGB 图像（黑色背景）: 前景 * mask，背景为黑色(0)
+            rgb_black_bg = rgb_out * alpha  # [H, W, 3] * [H, W, 1] 广播
+            rgb_black_bg = np.clip(rgb_black_bg, 0, 1).astype(np.float32)
+            
+            results.append(rgba_out)
+            rgb_results.append(rgb_black_bg)
         
-        # 组合结果
-        output = np.stack(results, axis=0)
-        output_tensor = torch.from_numpy(output).float()
+        # 组合 RGBA 结果
+        output_rgba = np.stack(results, axis=0)
+        output_rgba_tensor = torch.from_numpy(output_rgba).float()
         
-        return (output_tensor,)
+        # 组合 RGB 结果（黑色背景）
+        output_rgb = np.stack(rgb_results, axis=0)
+        output_rgb_tensor = torch.from_numpy(output_rgb).float()
+        
+        # 组合校正后的 mask
+        mask_output = np.stack(mask_results, axis=0)
+        mask_output_tensor = torch.from_numpy(mask_output).float()
+        
+        return (output_rgba_tensor, output_rgb_tensor, mask_output_tensor)
 
 
 NODE_CLASS_MAPPINGS = {
